@@ -3,48 +3,26 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
-	"reflect"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/ThomsonReutersEikon/go-ntlm/ntlm"
-	"github.com/bgentry/go-netrc/netrc"
+	"github.com/git-lfs/git-lfs/fs"
 	"github.com/git-lfs/git-lfs/git"
 	"github.com/git-lfs/git-lfs/tools"
 	"github.com/rubyist/tracerx"
 )
 
 var (
-	Config                 = New()
 	ShowConfigWarnings     = false
 	defaultRemote          = "origin"
 	gitConfigWarningPrefix = "lfs."
 )
-
-// FetchPruneConfig collects together the config options that control fetching and pruning
-type FetchPruneConfig struct {
-	// The number of days prior to current date for which (local) refs other than HEAD
-	// will be fetched with --recent (default 7, 0 = only fetch HEAD)
-	FetchRecentRefsDays int `git:"lfs.fetchrecentrefsdays"`
-	// Makes the FetchRecentRefsDays option apply to remote refs from fetch source as well (default true)
-	FetchRecentRefsIncludeRemotes bool `git:"lfs.fetchrecentremoterefs"`
-	// number of days prior to latest commit on a ref that we'll fetch previous
-	// LFS changes too (default 0 = only fetch at ref)
-	FetchRecentCommitsDays int `git:"lfs.fetchrecentcommitsdays"`
-	// Whether to always fetch recent even without --recent
-	FetchRecentAlways bool `git:"lfs.fetchrecentalways"`
-	// Number of days added to FetchRecent*; data outside combined window will be
-	// deleted when prune is run. (default 3)
-	PruneOffsetDays int `git:"lfs.pruneoffsetdays"`
-	// Always verify with remote before pruning
-	PruneVerifyRemoteAlways bool `git:"lfs.pruneverifyremotealways"`
-	// Name of remote to check for unpushed and verify checks
-	PruneRemoteName string `git:"lfs.pruneremotetocheck"`
-}
 
 type Configuration struct {
 	// Os provides a `*Environment` used to access to the system's
@@ -57,35 +35,97 @@ type Configuration struct {
 	// configuration.
 	Git Environment
 
-	CurrentRemote   string
-	NtlmSession     ntlm.ClientSession
-	envVars         map[string]string
-	envVarsMutex    sync.Mutex
-	IsTracingHttp   bool
-	IsDebuggingHttp bool
-	IsLoggingStats  bool
+	currentRemote *string
+	pushRemote    *string
 
-	loading        sync.Mutex // guards initialization of gitConfig and remotes
-	remotes        []string
-	extensions     map[string]Extension
-	manualEndpoint *Endpoint
-	parsedNetrc    netrcfinder
-	urlAliasesMap  map[string]string
-	urlAliasMu     sync.Mutex
+	// gitConfig can fetch or modify the current Git config and track the Git
+	// version.
+	gitConfig *git.Configuration
+
+	ref        *git.Ref
+	remoteRef  *git.Ref
+	fs         *fs.Filesystem
+	gitDir     *string
+	workDir    string
+	loading    sync.Mutex // guards initialization of gitConfig and remotes
+	loadingGit sync.Mutex // guards initialization of local git and working dirs
+	remotes    []string
+	extensions map[string]Extension
+	mask       int
+	maskOnce   sync.Once
+	timestamp  time.Time
 }
 
 func New() *Configuration {
+	return NewIn("", "")
+}
+
+func NewIn(workdir, gitdir string) *Configuration {
+	gitConf := git.NewConfig(workdir, gitdir)
 	c := &Configuration{
-		Os:            EnvironmentOf(NewOsFetcher()),
-		CurrentRemote: defaultRemote,
-		envVars:       make(map[string]string),
+		Os:        EnvironmentOf(NewOsFetcher()),
+		gitConfig: gitConf,
+		timestamp: time.Now(),
 	}
 
-	c.Git = &gitEnvironment{config: c}
-	c.IsTracingHttp = c.Os.Bool("GIT_CURL_VERBOSE", false)
-	c.IsDebuggingHttp = c.Os.Bool("LFS_DEBUG_HTTP", false)
-	c.IsLoggingStats = c.Os.Bool("GIT_LOG_STATS", false)
+	if len(gitConf.WorkDir) > 0 {
+		c.gitDir = &gitConf.GitDir
+		c.workDir = gitConf.WorkDir
+	}
+
+	c.Git = &delayedEnvironment{
+		callback: func() Environment {
+			sources, err := gitConf.Sources(filepath.Join(c.LocalWorkingDir(), ".lfsconfig"))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error reading git config: %s\n", err)
+			}
+			return c.readGitConfig(sources...)
+		},
+	}
 	return c
+}
+
+func (c *Configuration) getMask() int {
+	// This logic is necessarily complex because Git's logic is complex.
+	c.maskOnce.Do(func() {
+		val, ok := c.Git.Get("core.sharedrepository")
+		if !ok {
+			val = "umask"
+		} else if Bool(val, false) {
+			val = "group"
+		}
+
+		switch strings.ToLower(val) {
+		case "group", "true", "1":
+			c.mask = 007
+		case "all", "world", "everybody", "2":
+			c.mask = 002
+		case "umask", "false", "0":
+			c.mask = umask()
+		default:
+			if mode, err := strconv.ParseInt(val, 8, 16); err != nil {
+				// If this doesn't look like an octal number, then it
+				// could be a falsy value, in which case we should use
+				// the umask, or it's just invalid, in which case the
+				// umask is a safe bet.
+				c.mask = umask()
+			} else {
+				c.mask = 0666 & ^int(mode)
+			}
+		}
+	})
+	return c.mask
+}
+
+func (c *Configuration) readGitConfig(gitconfigs ...*git.ConfigurationSource) Environment {
+	gf, extensions, uniqRemotes := readGitConfig(gitconfigs...)
+	c.extensions = extensions
+	c.remotes = make([]string, 0, len(uniqRemotes))
+	for remote := range uniqRemotes {
+		c.remotes = append(c.remotes, remote)
+	}
+
+	return EnvironmentOf(gf)
 }
 
 // Values is a convenience type used to call the NewFromValues function. It
@@ -94,7 +134,7 @@ func New() *Configuration {
 type Values struct {
 	// Git and Os are the stand-in maps used to provide values for their
 	// respective environments.
-	Git, Os map[string]string
+	Git, Os map[string][]string
 }
 
 // NewFrom returns a new `*config.Configuration` that reads both its Git
@@ -103,167 +143,28 @@ type Values struct {
 //
 // This method should only be used during testing.
 func NewFrom(v Values) *Configuration {
-	return &Configuration{
-		Os:  EnvironmentOf(mapFetcher(v.Os)),
-		Git: EnvironmentOf(mapFetcher(v.Git)),
-
-		envVars: make(map[string]string, 0),
+	c := &Configuration{
+		Os:        EnvironmentOf(mapFetcher(v.Os)),
+		gitConfig: git.NewConfig("", ""),
+		timestamp: time.Now(),
 	}
-}
-
-// Unmarshal unmarshals the *Configuration in context into all of `v`'s fields,
-// according to the following rules:
-//
-// Values are marshaled according to the given key and environment, as follows:
-//	type T struct {
-//		Field string `git:"key"`
-//		Other string `os:"key"`
-//	}
-//
-// If an unknown environment is given, an error will be returned. If there is no
-// method supporting conversion into a field's type, an error will be returned.
-// If no value is associated with the given key and environment, the field will
-// // only be modified if there is a config value present matching the given
-// key. If the field is already set to a non-zero value of that field's type,
-// then it will be left alone.
-//
-// Otherwise, the field will be set to the value of calling the
-// appropriately-typed method on the specified environment.
-func (c *Configuration) Unmarshal(v interface{}) error {
-	into := reflect.ValueOf(v)
-	if into.Kind() != reflect.Ptr {
-		return fmt.Errorf("lfs/config: unable to parse non-pointer type of %T", v)
-	}
-	into = into.Elem()
-
-	for i := 0; i < into.Type().NumField(); i++ {
-		field := into.Field(i)
-		sfield := into.Type().Field(i)
-
-		key, env, err := c.parseTag(sfield.Tag)
-		if err != nil {
-			return err
-		}
-
-		if env == nil {
-			continue
-		}
-
-		var val interface{}
-		switch sfield.Type.Kind() {
-		case reflect.String:
-			var ok bool
-
-			val, ok = env.Get(key)
-			if !ok {
-				val = field.String()
+	c.Git = &delayedEnvironment{
+		callback: func() Environment {
+			source := &git.ConfigurationSource{
+				Lines: make([]string, 0, len(v.Git)),
 			}
-		case reflect.Int:
-			val = env.Int(key, int(field.Int()))
-		case reflect.Bool:
-			val = env.Bool(key, field.Bool())
-		default:
-			return fmt.Errorf(
-				"lfs/config: unsupported target type for field %q: %v",
-				sfield.Name, sfield.Type.String())
-		}
 
-		if val != nil {
-			into.Field(i).Set(reflect.ValueOf(val))
-		}
+			for key, values := range v.Git {
+				for _, value := range values {
+					fmt.Printf("Config: %s=%s\n", key, value)
+					source.Lines = append(source.Lines, fmt.Sprintf("%s=%s", key, value))
+				}
+			}
+
+			return c.readGitConfig(source)
+		},
 	}
-
-	return nil
-}
-
-// parseTag returns the key, environment, and optional error assosciated with a
-// given tag. It will return the XOR of either the `git` or `os` tag. That is to
-// say, a field tagged with EITHER `git` OR `os` is valid, but pone tagged with
-// both is not.
-//
-// If neither field was found, then a nil environment will be returned.
-func (c *Configuration) parseTag(tag reflect.StructTag) (key string, env Environment, err error) {
-	git, os := tag.Get("git"), tag.Get("os")
-
-	if len(git) != 0 && len(os) != 0 {
-		return "", nil, errors.New("lfs/config: ambiguous tags")
-	}
-
-	if len(git) != 0 {
-		return git, c.Git, nil
-	}
-	if len(os) != 0 {
-		return os, c.Os, nil
-	}
-
-	return
-}
-
-// GitRemoteUrl returns the git clone/push url for a given remote (blank if not found)
-// the forpush argument is to cater for separate remote.name.pushurl settings
-func (c *Configuration) GitRemoteUrl(remote string, forpush bool) string {
-	if forpush {
-		if u, ok := c.Git.Get("remote." + remote + ".pushurl"); ok {
-			return u
-		}
-	}
-
-	if u, ok := c.Git.Get("remote." + remote + ".url"); ok {
-		return u
-	}
-
-	if err := git.ValidateRemote(remote); err == nil {
-		return remote
-	}
-
-	return ""
-
-}
-
-// Manually set an Endpoint to use instead of deriving from Git config
-func (c *Configuration) SetManualEndpoint(e Endpoint) {
-	c.manualEndpoint = &e
-}
-
-func (c *Configuration) Endpoint(operation string) Endpoint {
-	if c.manualEndpoint != nil {
-		return *c.manualEndpoint
-	}
-
-	if operation == "upload" {
-		if url, ok := c.Git.Get("lfs.pushurl"); ok {
-			return NewEndpointWithConfig(url, c)
-		}
-	}
-
-	if url, ok := c.Git.Get("lfs.url"); ok {
-		return NewEndpointWithConfig(url, c)
-	}
-
-	if len(c.CurrentRemote) > 0 && c.CurrentRemote != defaultRemote {
-		if endpoint := c.RemoteEndpoint(c.CurrentRemote, operation); len(endpoint.Url) > 0 {
-			return endpoint
-		}
-	}
-
-	return c.RemoteEndpoint(defaultRemote, operation)
-}
-
-func (c *Configuration) ConcurrentTransfers() int {
-	if c.NtlmAccess("download") {
-		return 1
-	}
-
-	uploads := 3
-
-	if v, ok := c.Git.Get("lfs.concurrenttransfers"); ok {
-		n, err := strconv.Atoi(v)
-		if err == nil && n > 0 {
-			uploads = n
-		}
-	}
-
-	return uploads
+	return c
 }
 
 // BasicTransfersOnly returns whether to only allow "basic" HTTP transfers.
@@ -278,81 +179,6 @@ func (c *Configuration) TusTransfersAllowed() bool {
 	return c.Git.Bool("lfs.tustransfers", false)
 }
 
-func (c *Configuration) BatchTransfer() bool {
-	return c.Git.Bool("lfs.batch", true)
-}
-
-func (c *Configuration) NtlmAccess(operation string) bool {
-	return c.Access(operation) == "ntlm"
-}
-
-// PrivateAccess will retrieve the access value and return true if
-// the value is set to private. When a repo is marked as having private
-// access, the http requests for the batch api will fetch the credentials
-// before running, otherwise the request will run without credentials.
-func (c *Configuration) PrivateAccess(operation string) bool {
-	return c.Access(operation) != "none"
-}
-
-// Access returns the access auth type.
-func (c *Configuration) Access(operation string) string {
-	return c.EndpointAccess(c.Endpoint(operation))
-}
-
-// SetAccess will set the private access flag in .git/config.
-func (c *Configuration) SetAccess(operation string, authType string) {
-	c.SetEndpointAccess(c.Endpoint(operation), authType)
-}
-
-func (c *Configuration) FindNetrcHost(host string) (*netrc.Machine, error) {
-	c.loading.Lock()
-	defer c.loading.Unlock()
-	if c.parsedNetrc == nil {
-		n, err := c.parseNetrc()
-		if err != nil {
-			return nil, err
-		}
-		c.parsedNetrc = n
-	}
-
-	return c.parsedNetrc.FindMachine(host), nil
-}
-
-// Manually override the netrc config
-func (c *Configuration) SetNetrc(n netrcfinder) {
-	c.parsedNetrc = n
-}
-
-func (c *Configuration) EndpointAccess(e Endpoint) string {
-	key := fmt.Sprintf("lfs.%s.access", e.Url)
-	if v, ok := c.Git.Get(key); ok && len(v) > 0 {
-		lower := strings.ToLower(v)
-		if lower == "private" {
-			return "basic"
-		}
-		return lower
-	}
-	return "none"
-}
-
-func (c *Configuration) SetEndpointAccess(e Endpoint, authType string) {
-	c.loadGitConfig()
-
-	tracerx.Printf("setting repository access to %s", authType)
-	key := fmt.Sprintf("lfs.%s.access", e.Url)
-
-	// Modify the config cache because it's checked again in this process
-	// without being reloaded.
-	switch authType {
-	case "", "none":
-		git.Config.UnsetLocalKey("", key)
-		c.Git.del(key)
-	default:
-		git.Config.SetLocal("", key, authType)
-		c.Git.set(key, authType)
-	}
-}
-
 func (c *Configuration) FetchIncludePaths() []string {
 	patterns, _ := c.Git.Get("lfs.fetchinclude")
 	return tools.CleanPaths(patterns, ",")
@@ -363,47 +189,109 @@ func (c *Configuration) FetchExcludePaths() []string {
 	return tools.CleanPaths(patterns, ",")
 }
 
-func (c *Configuration) RemoteEndpoint(remote, operation string) Endpoint {
-	if len(remote) == 0 {
-		remote = defaultRemote
-	}
-
-	// Support separate push URL if specified and pushing
-	if operation == "upload" {
-		if url, ok := c.Git.Get("remote." + remote + ".lfspushurl"); ok {
-			return NewEndpointWithConfig(url, c)
+func (c *Configuration) CurrentRef() *git.Ref {
+	c.loading.Lock()
+	defer c.loading.Unlock()
+	if c.ref == nil {
+		r, err := git.CurrentRef()
+		if err != nil {
+			tracerx.Printf("Error loading current ref: %s", err)
+			c.ref = &git.Ref{}
+		} else {
+			c.ref = r
 		}
 	}
-	if url, ok := c.Git.Get("remote." + remote + ".lfsurl"); ok {
-		return NewEndpointWithConfig(url, c)
+	return c.ref
+}
+
+func (c *Configuration) IsDefaultRemote() bool {
+	return c.Remote() == defaultRemote
+}
+
+// Remote returns the default remote based on:
+// 1. The currently tracked remote branch, if present
+// 2. Any other SINGLE remote defined in .git/config
+// 3. Use "origin" as a fallback.
+// Results are cached after the first hit.
+func (c *Configuration) Remote() string {
+	ref := c.CurrentRef()
+
+	c.loading.Lock()
+	defer c.loading.Unlock()
+
+	if c.currentRemote == nil {
+		if len(ref.Name) == 0 {
+			c.currentRemote = &defaultRemote
+			return defaultRemote
+		}
+
+		if remote, ok := c.Git.Get(fmt.Sprintf("branch.%s.remote", ref.Name)); ok {
+			// try tracking remote
+			c.currentRemote = &remote
+		} else if remotes := c.Remotes(); len(remotes) == 1 {
+			// use only remote if there is only 1
+			c.currentRemote = &remotes[0]
+		} else {
+			// fall back to default :(
+			c.currentRemote = &defaultRemote
+		}
+	}
+	return *c.currentRemote
+}
+
+func (c *Configuration) PushRemote() string {
+	ref := c.CurrentRef()
+	c.loading.Lock()
+	defer c.loading.Unlock()
+
+	if c.pushRemote == nil {
+		if remote, ok := c.Git.Get(fmt.Sprintf("branch.%s.pushRemote", ref.Name)); ok {
+			c.pushRemote = &remote
+		} else if remote, ok := c.Git.Get("remote.pushDefault"); ok {
+			c.pushRemote = &remote
+		} else {
+			c.loading.Unlock()
+			remote := c.Remote()
+			c.loading.Lock()
+
+			c.pushRemote = &remote
+		}
 	}
 
-	// finally fall back on git remote url (also supports pushurl)
-	if url := c.GitRemoteUrl(remote, operation == "upload"); url != "" {
-		return NewEndpointFromCloneURLWithConfig(url, c)
-	}
+	return *c.pushRemote
+}
 
-	return Endpoint{}
+func (c *Configuration) SetValidRemote(name string) error {
+	if err := git.ValidateRemote(name); err != nil {
+		return err
+	}
+	c.SetRemote(name)
+	return nil
+}
+
+func (c *Configuration) SetValidPushRemote(name string) error {
+	if err := git.ValidateRemote(name); err != nil {
+		return err
+	}
+	c.SetPushRemote(name)
+	return nil
+}
+
+func (c *Configuration) SetRemote(name string) {
+	c.currentRemote = &name
+}
+
+func (c *Configuration) SetPushRemote(name string) {
+	c.pushRemote = &name
 }
 
 func (c *Configuration) Remotes() []string {
 	c.loadGitConfig()
-
 	return c.remotes
-}
-
-// GitProtocol returns the protocol for the LFS API when converting from a
-// git:// remote url.
-func (c *Configuration) GitProtocol() string {
-	if value, ok := c.Git.Get("lfs.gitprotocol"); ok {
-		return value
-	}
-	return "https"
 }
 
 func (c *Configuration) Extensions() map[string]Extension {
 	c.loadGitConfig()
-
 	return c.extensions
 }
 
@@ -412,66 +300,175 @@ func (c *Configuration) SortedExtensions() ([]Extension, error) {
 	return SortExtensions(c.Extensions())
 }
 
-func (c *Configuration) urlAliases() map[string]string {
-	c.urlAliasMu.Lock()
-	defer c.urlAliasMu.Unlock()
-
-	if c.urlAliasesMap == nil {
-		c.urlAliasesMap = make(map[string]string)
-		prefix := "url."
-		suffix := ".insteadof"
-		for gitkey, gitval := range c.Git.All() {
-			if strings.HasPrefix(gitkey, prefix) && strings.HasSuffix(gitkey, suffix) {
-				if _, ok := c.urlAliasesMap[gitval]; ok {
-					fmt.Fprintf(os.Stderr, "WARNING: Multiple 'url.*.insteadof' keys with the same alias: %q\n", gitval)
-				}
-				c.urlAliasesMap[gitval] = gitkey[len(prefix) : len(gitkey)-len(suffix)]
-			}
-		}
-	}
-
-	return c.urlAliasesMap
-}
-
-// ReplaceUrlAlias returns a url with a prefix from a `url.*.insteadof` git
-// config setting. If multiple aliases match, use the longest one.
-// See https://git-scm.com/docs/git-config for Git's docs.
-func (c *Configuration) ReplaceUrlAlias(rawurl string) string {
-	var longestalias string
-	aliases := c.urlAliases()
-	for alias, _ := range aliases {
-		if !strings.HasPrefix(rawurl, alias) {
-			continue
-		}
-
-		if longestalias < alias {
-			longestalias = alias
-		}
-	}
-
-	if len(longestalias) > 0 {
-		return aliases[longestalias] + rawurl[len(longestalias):]
-	}
-
-	return rawurl
-}
-
-func (c *Configuration) FetchPruneConfig() FetchPruneConfig {
-	f := &FetchPruneConfig{
-		FetchRecentRefsDays:           7,
-		FetchRecentRefsIncludeRemotes: true,
-		PruneOffsetDays:               3,
-		PruneRemoteName:               "origin",
-	}
-
-	if err := c.Unmarshal(f); err != nil {
-		panic(err.Error())
-	}
-	return *f
-}
-
 func (c *Configuration) SkipDownloadErrors() bool {
 	return c.Os.Bool("GIT_LFS_SKIP_DOWNLOAD_ERRORS", false) || c.Git.Bool("lfs.skipdownloaderrors", false)
+}
+
+func (c *Configuration) SetLockableFilesReadOnly() bool {
+	return c.Os.Bool("GIT_LFS_SET_LOCKABLE_READONLY", true) && c.Git.Bool("lfs.setlockablereadonly", true)
+}
+
+func (c *Configuration) ForceProgress() bool {
+	return c.Os.Bool("GIT_LFS_FORCE_PROGRESS", false) || c.Git.Bool("lfs.forceprogress", false)
+}
+
+// HookDir returns the location of the hooks owned by this repository. If the
+// core.hooksPath configuration variable is supported, we prefer that and expand
+// paths appropriately.
+func (c *Configuration) HookDir() (string, error) {
+	if git.IsGitVersionAtLeast("2.9.0") {
+		hp, ok := c.Git.Get("core.hooksPath")
+		if ok {
+			return tools.ExpandPath(hp, false)
+		}
+	}
+	return filepath.Join(c.LocalGitDir(), "hooks"), nil
+}
+
+func (c *Configuration) InRepo() bool {
+	return len(c.LocalGitDir()) > 0
+}
+
+func (c *Configuration) LocalWorkingDir() string {
+	c.loadGitDirs()
+	return c.workDir
+}
+
+func (c *Configuration) LocalGitDir() string {
+	c.loadGitDirs()
+	return *c.gitDir
+}
+
+func (c *Configuration) loadGitDirs() {
+	c.loadingGit.Lock()
+	defer c.loadingGit.Unlock()
+
+	if c.gitDir != nil {
+		return
+	}
+
+	gitdir, workdir, err := git.GitAndRootDirs()
+	if err != nil {
+		errMsg := err.Error()
+		tracerx.Printf("Error running 'git rev-parse': %s", errMsg)
+		if !strings.Contains(strings.ToLower(errMsg),
+			"not a git repository") {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", errMsg)
+		}
+		c.gitDir = &gitdir
+	}
+
+	gitdir = tools.ResolveSymlinks(gitdir)
+	c.gitDir = &gitdir
+	c.workDir = tools.ResolveSymlinks(workdir)
+}
+
+func (c *Configuration) LocalGitStorageDir() string {
+	return c.Filesystem().GitStorageDir
+}
+
+func (c *Configuration) LocalReferenceDirs() []string {
+	return c.Filesystem().ReferenceDirs
+}
+
+func (c *Configuration) LFSStorageDir() string {
+	return c.Filesystem().LFSStorageDir
+}
+
+func (c *Configuration) LFSObjectDir() string {
+	return c.Filesystem().LFSObjectDir()
+}
+
+func (c *Configuration) LFSObjectExists(oid string, size int64) bool {
+	return c.Filesystem().ObjectExists(oid, size)
+}
+
+func (c *Configuration) EachLFSObject(fn func(fs.Object) error) error {
+	return c.Filesystem().EachObject(fn)
+}
+
+func (c *Configuration) LocalLogDir() string {
+	return c.Filesystem().LogDir()
+}
+
+func (c *Configuration) TempDir() string {
+	return c.Filesystem().TempDir()
+}
+
+func (c *Configuration) Filesystem() *fs.Filesystem {
+	c.loadGitDirs()
+	c.loading.Lock()
+	defer c.loading.Unlock()
+
+	if c.fs == nil {
+		lfsdir, _ := c.Git.Get("lfs.storage")
+		c.fs = fs.New(
+			c.Os,
+			c.LocalGitDir(),
+			c.LocalWorkingDir(),
+			lfsdir,
+		)
+	}
+
+	return c.fs
+}
+
+func (c *Configuration) Cleanup() error {
+	c.loading.Lock()
+	defer c.loading.Unlock()
+	return c.fs.Cleanup()
+}
+
+func (c *Configuration) OSEnv() Environment {
+	return c.Os
+}
+
+func (c *Configuration) GitEnv() Environment {
+	return c.Git
+}
+
+func (c *Configuration) GitConfig() *git.Configuration {
+	return c.gitConfig
+}
+
+func (c *Configuration) FindGitGlobalKey(key string) string {
+	return c.gitConfig.FindGlobal(key)
+}
+
+func (c *Configuration) FindGitSystemKey(key string) string {
+	return c.gitConfig.FindSystem(key)
+}
+
+func (c *Configuration) FindGitLocalKey(key string) string {
+	return c.gitConfig.FindLocal(key)
+}
+
+func (c *Configuration) SetGitGlobalKey(key, val string) (string, error) {
+	return c.gitConfig.SetGlobal(key, val)
+}
+
+func (c *Configuration) SetGitSystemKey(key, val string) (string, error) {
+	return c.gitConfig.SetSystem(key, val)
+}
+
+func (c *Configuration) SetGitLocalKey(key, val string) (string, error) {
+	return c.gitConfig.SetLocal(key, val)
+}
+
+func (c *Configuration) UnsetGitGlobalSection(key string) (string, error) {
+	return c.gitConfig.UnsetGlobalSection(key)
+}
+
+func (c *Configuration) UnsetGitSystemSection(key string) (string, error) {
+	return c.gitConfig.UnsetSystemSection(key)
+}
+
+func (c *Configuration) UnsetGitLocalSection(key string) (string, error) {
+	return c.gitConfig.UnsetLocalSection(key)
+}
+
+func (c *Configuration) UnsetGitLocalKey(key string) (string, error) {
+	return c.gitConfig.UnsetLocalKey(key)
 }
 
 // loadGitConfig is a temporary measure to support legacy behavior dependent on
@@ -485,10 +482,135 @@ func (c *Configuration) SkipDownloadErrors() bool {
 //
 // loadGitConfig returns a bool returning whether or not `loadGitConfig` was
 // called AND the method did not return early.
-func (c *Configuration) loadGitConfig() bool {
-	if g, ok := c.Git.(*gitEnvironment); ok {
-		return g.loadGitConfig()
+func (c *Configuration) loadGitConfig() {
+	if g, ok := c.Git.(*delayedEnvironment); ok {
+		g.Load()
+	}
+}
+
+var (
+	// dateFormats is a list of all the date formats that Git accepts,
+	// except for the built-in one, which is handled below.
+	dateFormats = []string{
+		"Mon, 02 Jan 2006 15:04:05 -0700",
+		"2006-01-02T15:04:05-0700",
+		"2006-01-02 15:04:05-0700",
+		"2006.01.02T15:04:05-0700",
+		"2006.01.02 15:04:05-0700",
+		"01/02/2006T15:04:05-0700",
+		"01/02/2006 15:04:05-0700",
+		"02.01.2006T15:04:05-0700",
+		"02.01.2006 15:04:05-0700",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02 15:04:05Z",
+		"2006.01.02T15:04:05Z",
+		"2006.01.02 15:04:05Z",
+		"01/02/2006T15:04:05Z",
+		"01/02/2006 15:04:05Z",
+		"02.01.2006T15:04:05Z",
+		"02.01.2006 15:04:05Z",
 	}
 
-	return false
+	// defaultDatePattern is the regexp for Git's native date format.
+	defaultDatePattern = regexp.MustCompile(`\A(\d+) ([+-])(\d{2})(\d{2})\z`)
+)
+
+// findUserData returns the name/email that should be used in the commit header.
+// We use the same technique as Git for finding this information, except that we
+// don't fall back to querying the system for defaults if no values are found in
+// the Git configuration or environment.
+//
+// envType should be "author" or "committer".
+func (c *Configuration) findUserData(envType string) (name, email string) {
+	var filter = func(r rune) rune {
+		switch r {
+		case '<', '>', '\n':
+			return -1
+		default:
+			return r
+		}
+	}
+
+	envType = strings.ToUpper(envType)
+
+	name, ok := c.Os.Get("GIT_" + envType + "_NAME")
+	if !ok {
+		name, _ = c.Git.Get("user.name")
+	}
+
+	email, ok = c.Os.Get("GIT_" + envType + "_EMAIL")
+	if !ok {
+		email, ok = c.Git.Get("user.email")
+	}
+	if !ok {
+		email, _ = c.Os.Get("EMAIL")
+	}
+
+	// Git filters certain characters out of the name and email fields.
+	name = strings.Map(filter, name)
+	email = strings.Map(filter, email)
+	return
+}
+
+func (c *Configuration) findUserTimestamp(envType string) time.Time {
+	date, ok := c.Os.Get(fmt.Sprintf("GIT_%s_DATE", strings.ToUpper(envType)))
+	if !ok {
+		return c.timestamp
+	}
+
+	// time.Parse doesn't parse seconds from the Epoch, like we use in the
+	// Git native format, so we have to do it ourselves.
+	strs := defaultDatePattern.FindStringSubmatch(date)
+	if strs != nil {
+		unixSecs, _ := strconv.ParseInt(strs[1], 10, 64)
+		hours, _ := strconv.Atoi(strs[3])
+		offset, _ := strconv.Atoi(strs[4])
+		offset = (offset + hours*60) * 60
+		if strs[2] == "-" {
+			offset = -offset
+		}
+
+		return time.Unix(unixSecs, 0).In(time.FixedZone("", offset))
+	}
+
+	for _, format := range dateFormats {
+		if t, err := time.Parse(format, date); err == nil {
+			return t
+		}
+	}
+
+	// The user provided an invalid value, so default to the current time.
+	return c.timestamp
+}
+
+// CurrentCommitter returns the name/email that would be used to commit a change
+// with this configuration. In particular, the "user.name" and "user.email"
+// configuration values are used
+func (c *Configuration) CurrentCommitter() (name, email string) {
+	return c.findUserData("committer")
+}
+
+// CurrentCommitterTimestamp returns the timestamp that would be used to commit
+// a change with this configuration.
+func (c *Configuration) CurrentCommitterTimestamp() time.Time {
+	return c.findUserTimestamp("committer")
+}
+
+// CurrentAuthor returns the name/email that would be used to author a change
+// with this configuration. In particular, the "user.name" and "user.email"
+// configuration values are used
+func (c *Configuration) CurrentAuthor() (name, email string) {
+	return c.findUserData("author")
+}
+
+// CurrentCommitterTimestamp returns the timestamp that would be used to commit
+// a change with this configuration.
+func (c *Configuration) CurrentAuthorTimestamp() time.Time {
+	return c.findUserTimestamp("author")
+}
+
+// RepositoryPermissions returns the permissions that should be used to write
+// files in the repository.
+func (c *Configuration) RepositoryPermissions() os.FileMode {
+	return os.FileMode(0666 & ^c.getMask())
 }

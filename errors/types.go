@@ -2,6 +2,7 @@ package errors
 
 import (
 	"fmt"
+	"net/url"
 
 	"github.com/pkg/errors"
 )
@@ -126,6 +127,20 @@ func IsDownloadDeclinedError(err error) bool {
 	return false
 }
 
+// IsDownloadDeclinedError indicates that the upload operation failed because of
+// an HTTP 422 response code.
+func IsUnprocessableEntityError(err error) bool {
+	if e, ok := err.(interface {
+		UnprocessableEntityError() bool
+	}); ok {
+		return e.UnprocessableEntityError()
+	}
+	if parent := parentOf(err); parent != nil {
+		return IsUnprocessableEntityError(parent)
+	}
+	return false
+}
+
 // IsRetriableError indicates the low level transfer had an error but the
 // caller may retry the operation.
 func IsRetriableError(err error) bool {
@@ -133,6 +148,9 @@ func IsRetriableError(err error) bool {
 		RetriableError() bool
 	}); ok {
 		return e.RetriableError()
+	}
+	if cause, ok := Cause(err).(*url.Error); ok {
+		return cause.Temporary() || cause.Timeout()
 	}
 	if parent := parentOf(err); parent != nil {
 		return IsRetriableError(parent)
@@ -317,6 +335,20 @@ func NewDownloadDeclinedError(err error, msg string) error {
 	return downloadDeclinedError{newWrappedError(err, msg)}
 }
 
+// Definitions for IsUnprocessableEntityError()
+
+type unprocessableEntityError struct {
+	*wrappedError
+}
+
+func (e unprocessableEntityError) UnprocessableEntityError() bool {
+	return true
+}
+
+func NewUnprocessableEntityError(err error) error {
+	return unprocessableEntityError{newWrappedError(err, "")}
+}
+
 // Definitions for IsRetriableError()
 
 type retriableError struct {
@@ -332,8 +364,14 @@ func NewRetriableError(err error) error {
 }
 
 func parentOf(err error) error {
-	if c, ok := err.(errorWithCause); ok {
-		return c.Cause()
+	type causer interface {
+		Cause() error
+	}
+
+	if c, ok := err.(causer); ok {
+		if innerC, innerOk := c.Cause().(causer); innerOk {
+			return innerC.Cause()
+		}
 	}
 
 	return nil

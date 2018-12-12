@@ -3,6 +3,8 @@
 Hi there! We're thrilled that you'd like to contribute to this project. Your
 help is essential for keeping it great.
 
+Contributions to this project are [released](https://help.github.com/articles/github-terms-of-service/#6-contributions-under-repository-license) to the public under the [project's open source license](LICENSE.md).
+
 This project adheres to the [Open Code of Conduct](./CODE-OF-CONDUCT.md). By participating, you are expected to uphold this code.
 
 ## Feature Requests
@@ -23,31 +25,22 @@ into Git: SSH through public keys, and HTTPS through Git credential helpers.
 Servers can simply host off cloud storage, or implement more efficient methods
 of transferring data.
 
-You can see what the Git LFS team is prioritizing work on in the
-[roadmap](./ROADMAP.md).
-
 ## Project Management
 
-The Git LFS project is managed completely through this open source project and
-its [chat room][chat]. The [roadmap][] shows the high level items that are
-prioritized for future work. Suggestions for major features should be submitted
-as a pull request that adds a markdown file to `docs/proposals` discussing the
-feature. This gives the community time to discuss it before a lot of code has
-been written. Roadmap items are linked to one or more Issue task lists ([example][roadmap-items]), with the `roadmap` label, that go into more detail.
+The Git LFS project is managed completely through this open source project. The
+[milestones][] show the high level items that are prioritized for future work.
+Suggestions for major features should be submitted as a pull request that adds a
+markdown file to `docs/proposals` discussing the feature. This gives the
+community time to discuss it before a lot of code has been written.
 
-[chat]: https://gitter.im/git-lfs/git-lfs
-[roadmap]: ./ROADMAP.md
-[roadmap-items]: https://github.com/git-lfs/git-lfs/issues/490
+[milestones]: https://github.com/git-lfs/git-lfs/milestones
 
 The Git LFS teams mark issues and pull requests with the following labels:
 
 * `bug` - An issue describing a bug.
-* `core-team` - An issue relating to the governance of the project.
 * `enhancement` - An issue for a possible new feature.
 * `review` - A pull request ready to be reviewed.
 * `release` - A checklist issue showing items marked for an upcoming release.
-* `roadmap` - A checklist issue with tasks to fulfill something from the
-[roadmap](./ROADMAP.md)
 
 ## Branching strategy
 
@@ -55,14 +48,13 @@ In general, contributors should develop on branches based off of `master` and pu
 
 ## Submitting a pull request
 
-0. [Fork][] and clone the repository
-0. Configure and install the dependencies: `script/bootstrap`
-0. Make sure the tests pass on your machine: `script/test`
-0. Create a new branch based on `master`: `git checkout -b <my-branch-name> master`
-0. Make your change, add tests, and make sure the tests still pass
-0. Push to your fork and [submit a pull request][pr] from your branch to `master`
-0. Accept the [GitHub CLA][cla]
-0. Pat yourself on the back and wait for your pull request to be reviewed
+1. [Fork][] and clone the repository
+1. Configure and install the dependencies: `make`
+1. Make sure the tests pass on your machine: `make test`
+1. Create a new branch based on `master`: `git checkout -b <my-branch-name> master`
+1. Make your change, add tests, and make sure the tests still pass
+1. Push to your fork and [submit a pull request][pr] from your branch to `master`
+1. Pat yourself on the back and wait for your pull request to be reviewed
 
 Here are a few things you can do that will increase the likelihood of your pull request being accepted:
 
@@ -78,74 +70,53 @@ them as separate pull requests.
 
 ### Prerequisites
 
-Git LFS depends on having a working Go 1.5+ environment, with your standard
-`$GOROOT` and `$GOPATH` environment variables set.
+Git LFS depends on having a working Go 1.11.0+ environment.
 
 On RHEL etc. e.g. Red Hat Enterprise Linux Server release 7.2 (Maipo), you will neet the minimum packages installed to build Git LFS:
 
-```
+```ShellSession
 $ sudo yum install gcc
 $ sudo yum install perl-Digest-SHA
 ```
 
 In order to run the RPM build `rpm/build_rpms.bsh` you will also need to:
 
-`$ sudo yum install ruby-devel`
+```ShellSession
+$ sudo yum install ruby-devel
+```
 
 (note on an AWS instance you may first need to `sudo yum-config-manager --enable rhui-REGION-rhel-server-optional`)
 
 ### Building Git LFS
 
-The easiest way to download Git LFS for making changes is `go get`:
+The easiest way to download Git LFS for making changes is `git clone`:
 
-    $ go get github.com/git-lfs/git-lfs
+```ShellSession
+$ git clone git@github.com:git-lfs/git-lfs.git
+$ cd git-lfs
+```
 
-This clones the Git LFS repository to your `$GOPATH`. If you typically keep
-your projects in a specific directory, you can symlink it from `$GOPATH`:
-
-    $ cd ~/path/to/your/projects
-    $ ln -s $GOPATH/src/github.com/git-lfs/git-lfs
-
-From here, run `script/bootstrap` to build Git LFS in the `./bin` directory.
-Before submitting changes, be sure to run the Go tests and the shell integration
+From here, run `make` to build Git LFS in the `./bin` directory. Before
+submitting changes, be sure to run the Go tests and the shell integration
 tests:
 
-    $ script/test        # runs just the Go tests
-    $ script/integration # runs the shell tests in ./test
-    $ script/cibuild     # runs everything, with verbose debug output
+```ShellSession
+$ make test          # runs just the Go tests
+$ cd t && make test  # runs the shell tests in ./test
+$ script/cibuild     # runs everything, with verbose debug output
+```
 
 ## Updating 3rd party packages
 
-0. Update `glide.yaml`.
-0. Run `script/vendor` to update the code in the `vendor` directory.
-0. Commit the change.  Git LFS vendors the full source code in the repository.
-0. Submit a pull request.
+1. Update `go.mod`.
+1. Run `make vendor` to update the code in the `vendor` directory.
+1. Commit the change.  Git LFS vendors the full source code in the repository.
+1. Submit a pull request.
 
 ## Releasing
 
-If you are the current maintainer:
-
-* Create a [new draft Release](https://github.com/git-lfs/git-lfs/releases/new).
-List any changes with links to related PRs.
-* Make sure your local dependencies are up to date: `script/bootstrap`
-* Ensure that tests are green: `script/cibuild`
-* Bump the version in `lfs/lfs.go`, [like this](https://github.com/git-lfs/git-lfs/commit/dd17828e4a6f2394cbba8621037199dc28f046e8).
-* Add the new version to the top of CHANGELOG.md
-* Build for all platforms with `script/bootstrap -all` (you need Go setup for
-cross compiling with Mac, Linux, FreeBSD, and Windows support).
-* Test the command locally.  The compiled version will be in `bin/releases/{os}-{arch}/git-lfs-{version}/git-lfs`
-* Get the draft Release ID from the GitHub API: `curl -in https://api.github.com/repos/git-lfs/git-lfs/releases`
-* Run `script/release -id {id}` to upload all of the compiled binaries to the
-release.
-* Publish the Release on GitHub.
-* Update [Git LFS website](https://github.com/git-lfs/git-lfs.github.com/blob/gh-pages/_config.yml#L4)
-(release engineer access rights required).
-* Ping external teams on GitHub:
-  * @github/desktop
-* Build packages:
-  * rpm
-  * apt
-* Bump homebrew version and generate the homebrew hash with `curl --location https://github.com/git-lfs/git-lfs/archive/vx.y.z.tar.gz | shasum -a 256` ([example](https://github.com/Homebrew/homebrew-core/pull/413/commits/dc0eb1f62514f48f3f5a8d01ad3bea06f78bd566))
+If you are the current maintainer, see
+[the release howto](./docs/howto/release-git-lfs.md) for how to perform a release.
 
 ## Resources
 
@@ -156,4 +127,3 @@ release.
 [fork]: https://github.com/git-lfs/git-lfs/fork
 [pr]: https://github.com/git-lfs/git-lfs/compare
 [style]: https://github.com/golang/go/wiki/CodeReviewComments
-[cla]: https://cla.github.com/git-lfs/git-lfs/accept

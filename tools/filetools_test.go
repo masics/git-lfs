@@ -4,137 +4,187 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strings"
-	"sync"
 	"testing"
 
 	"github.com/git-lfs/git-lfs/subprocess"
-
 	"github.com/stretchr/testify/assert"
 )
 
 func TestCleanPathsCleansPaths(t *testing.T) {
 	cleaned := CleanPaths("/foo/bar/,/foo/bar/baz", ",")
-
 	assert.Equal(t, []string{"/foo/bar", "/foo/bar/baz"}, cleaned)
 }
 
 func TestCleanPathsReturnsNoResultsWhenGivenNoPaths(t *testing.T) {
 	cleaned := CleanPaths("", ",")
-
 	assert.Empty(t, cleaned)
 }
 
-func TestFileMatch(t *testing.T) {
-	assert.True(t, FileMatch("filename.txt", "filename.txt"))
-	assert.True(t, FileMatch("*.txt", "filename.txt"))
-	assert.False(t, FileMatch("*.tx", "filename.txt"))
-	assert.True(t, FileMatch("f*.txt", "filename.txt"))
-	assert.False(t, FileMatch("g*.txt", "filename.txt"))
-	assert.True(t, FileMatch("file*", "filename.txt"))
-	assert.False(t, FileMatch("file", "filename.txt"))
+type ExpandPathTestCase struct {
+	Path   string
+	Expand bool
 
-	// With no path separators, should match in subfolders
-	assert.True(t, FileMatch("*.txt", "sub/filename.txt"))
-	assert.False(t, FileMatch("*.tx", "sub/filename.txt"))
-	assert.True(t, FileMatch("f*.txt", "sub/filename.txt"))
-	assert.False(t, FileMatch("g*.txt", "sub/filename.txt"))
-	assert.True(t, FileMatch("file*", "sub/filename.txt"))
-	assert.False(t, FileMatch("file", "sub/filename.txt"))
-	// Needs wildcard for exact filename
-	assert.True(t, FileMatch("**/filename.txt", "sub/sub/sub/filename.txt"))
+	Want    string
+	WantErr string
 
-	// Should not match dots to subparts
-	assert.False(t, FileMatch("*.ign", "sub/shouldignoreme.txt"))
-
-	// Path specific
-	assert.True(t, FileMatch("sub", "sub/filename.txt"))
-	assert.False(t, FileMatch("sub", "subfilename.txt"))
-
-	// Absolute
-	assert.True(t, FileMatch("*.dat", "/path/to/sub/.git/test.dat"))
-	assert.True(t, FileMatch("**/.git", "/path/to/sub/.git"))
-
-	// Match anything
-	assert.True(t, FileMatch(".", "path.txt"))
-	assert.True(t, FileMatch("./", "path.txt"))
-	assert.True(t, FileMatch(".\\", "path.txt"))
-
+	currentUser func() (*user.User, error)
+	lookupUser  func(who string) (*user.User, error)
 }
 
-type TestIncludeExcludeCase struct {
-	expectedResult bool
-	includes       []string
-	excludes       []string
-}
-
-func TestFilterIncludeExclude(t *testing.T) {
-
-	cases := []TestIncludeExcludeCase{
-		// Null case
-		TestIncludeExcludeCase{true, nil, nil},
-		// Inclusion
-		TestIncludeExcludeCase{true, []string{"*.dat"}, nil},
-		TestIncludeExcludeCase{true, []string{"file*.dat"}, nil},
-		TestIncludeExcludeCase{true, []string{"file*"}, nil},
-		TestIncludeExcludeCase{true, []string{"*name.dat"}, nil},
-		TestIncludeExcludeCase{false, []string{"/*.dat"}, nil},
-		TestIncludeExcludeCase{false, []string{"otherfolder/*.dat"}, nil},
-		TestIncludeExcludeCase{false, []string{"*.nam"}, nil},
-		TestIncludeExcludeCase{true, []string{"test/filename.dat"}, nil},
-		TestIncludeExcludeCase{true, []string{"test/filename.dat"}, nil},
-		TestIncludeExcludeCase{false, []string{"blank", "something", "foo"}, nil},
-		TestIncludeExcludeCase{false, []string{"test/notfilename.dat"}, nil},
-		TestIncludeExcludeCase{true, []string{"test"}, nil},
-		TestIncludeExcludeCase{true, []string{"test/*"}, nil},
-		TestIncludeExcludeCase{false, []string{"nottest"}, nil},
-		TestIncludeExcludeCase{false, []string{"nottest/*"}, nil},
-		TestIncludeExcludeCase{true, []string{"test/fil*"}, nil},
-		TestIncludeExcludeCase{false, []string{"test/g*"}, nil},
-		TestIncludeExcludeCase{true, []string{"tes*/*"}, nil},
-		// Exclusion
-		TestIncludeExcludeCase{false, nil, []string{"*.dat"}},
-		TestIncludeExcludeCase{false, nil, []string{"file*.dat"}},
-		TestIncludeExcludeCase{false, nil, []string{"file*"}},
-		TestIncludeExcludeCase{false, nil, []string{"*name.dat"}},
-		TestIncludeExcludeCase{true, nil, []string{"/*.dat"}},
-		TestIncludeExcludeCase{true, nil, []string{"otherfolder/*.dat"}},
-		TestIncludeExcludeCase{false, nil, []string{"test/filename.dat"}},
-		TestIncludeExcludeCase{false, nil, []string{"blank", "something", "test/filename.dat", "foo"}},
-		TestIncludeExcludeCase{true, nil, []string{"blank", "something", "foo"}},
-		TestIncludeExcludeCase{true, nil, []string{"test/notfilename.dat"}},
-		TestIncludeExcludeCase{false, nil, []string{"test"}},
-		TestIncludeExcludeCase{false, nil, []string{"test/*"}},
-		TestIncludeExcludeCase{true, nil, []string{"nottest"}},
-		TestIncludeExcludeCase{true, nil, []string{"nottest/*"}},
-		TestIncludeExcludeCase{false, nil, []string{"test/fil*"}},
-		TestIncludeExcludeCase{true, nil, []string{"test/g*"}},
-		TestIncludeExcludeCase{false, nil, []string{"tes*/*"}},
-
-		// Both
-		TestIncludeExcludeCase{true, []string{"test/filename.dat"}, []string{"test/notfilename.dat"}},
-		TestIncludeExcludeCase{false, []string{"test"}, []string{"test/filename.dat"}},
-		TestIncludeExcludeCase{true, []string{"test/*"}, []string{"test/notfile*"}},
-		TestIncludeExcludeCase{false, []string{"test/*"}, []string{"test/file*"}},
-		TestIncludeExcludeCase{false, []string{"another/*", "test/*"}, []string{"test/notfilename.dat", "test/filename.dat"}},
+func (c *ExpandPathTestCase) Assert(t *testing.T) {
+	if c.currentUser != nil {
+		oldCurrentUser := currentUser
+		currentUser = c.currentUser
+		defer func() { currentUser = oldCurrentUser }()
 	}
 
-	for _, c := range cases {
-		result := FilenamePassesIncludeExcludeFilter("test/filename.dat", c.includes, c.excludes)
-		assert.Equal(t, c.expectedResult, result, "includes: %v excludes: %v", c.includes, c.excludes)
-		if runtime.GOOS == "windows" {
-			// also test with \ path separators, tolerate mixed separators
-			for i, inc := range c.includes {
-				c.includes[i] = strings.Replace(inc, "/", "\\", -1)
-			}
-			for i, ex := range c.excludes {
-				c.excludes[i] = strings.Replace(ex, "/", "\\", -1)
-			}
-			assert.Equal(t, c.expectedResult, FilenamePassesIncludeExcludeFilter("test/filename.dat", c.includes, c.excludes), c)
-		}
+	if c.lookupUser != nil {
+		oldLookupUser := lookupUser
+		lookupUser = c.lookupUser
+		defer func() { lookupUser = oldLookupUser }()
+	}
+
+	got, err := ExpandPath(c.Path, c.Expand)
+	if err != nil || len(c.WantErr) > 0 {
+		assert.EqualError(t, err, c.WantErr)
+	}
+	assert.Equal(t, filepath.ToSlash(c.Want), filepath.ToSlash(got))
+}
+
+func TestExpandPath(t *testing.T) {
+	for desc, c := range map[string]*ExpandPathTestCase{
+		"no expand": {
+			Path: "/path/to/hooks",
+			Want: "/path/to/hooks",
+		},
+		"current": {
+			Path: "~/path/to/hooks",
+			Want: "/home/jane/path/to/hooks",
+			currentUser: func() (*user.User, error) {
+				return &user.User{
+					HomeDir: "/home/jane",
+				}, nil
+			},
+		},
+		"current, slash": {
+			Path: "~/",
+			Want: "/home/jane",
+			currentUser: func() (*user.User, error) {
+				return &user.User{
+					HomeDir: "/home/jane",
+				}, nil
+			},
+		},
+		"current, no slash": {
+			Path: "~",
+			Want: "/home/jane",
+			currentUser: func() (*user.User, error) {
+				return &user.User{
+					HomeDir: "/home/jane",
+				}, nil
+			},
+		},
+		"non-current": {
+			Path: "~other/path/to/hooks",
+			Want: "/home/special/path/to/hooks",
+			lookupUser: func(who string) (*user.User, error) {
+				assert.Equal(t, "other", who)
+				return &user.User{
+					HomeDir: "/home/special",
+				}, nil
+			},
+		},
+		"non-current, no slash": {
+			Path: "~other",
+			Want: "/home/special",
+			lookupUser: func(who string) (*user.User, error) {
+				assert.Equal(t, "other", who)
+				return &user.User{
+					HomeDir: "/home/special",
+				}, nil
+			},
+		},
+		"non-current (missing)": {
+			Path:    "~other/path/to/hooks",
+			WantErr: "could not find user other: missing",
+			lookupUser: func(who string) (*user.User, error) {
+				assert.Equal(t, "other", who)
+				return nil, fmt.Errorf("missing")
+			},
+		},
+	} {
+		t.Run(desc, c.Assert)
+	}
+}
+
+type ExpandConfigPathTestCase struct {
+	Path        string
+	DefaultPath string
+
+	Want    string
+	WantErr string
+
+	currentUser      func() (*user.User, error)
+	lookupConfigHome func() string
+}
+
+func (c *ExpandConfigPathTestCase) Assert(t *testing.T) {
+	if c.currentUser != nil {
+		oldCurrentUser := currentUser
+		currentUser = c.currentUser
+		defer func() { currentUser = oldCurrentUser }()
+	}
+
+	if c.lookupConfigHome != nil {
+		oldLookupConfigHome := lookupConfigHome
+		lookupConfigHome = c.lookupConfigHome
+		defer func() { lookupConfigHome = oldLookupConfigHome }()
+	}
+
+	got, err := ExpandConfigPath(c.Path, c.DefaultPath)
+	if err != nil || len(c.WantErr) > 0 {
+		assert.EqualError(t, err, c.WantErr)
+	}
+	assert.Equal(t, filepath.ToSlash(c.Want), filepath.ToSlash(got))
+}
+
+func TestExpandConfigPath(t *testing.T) {
+	for desc, c := range map[string]*ExpandConfigPathTestCase{
+		"unexpanded full path": {
+			Path: "/path/to/attributes",
+			Want: "/path/to/attributes",
+		},
+		"expanded full path": {
+			Path: "~/path/to/attributes",
+			Want: "/home/pat/path/to/attributes",
+			currentUser: func() (*user.User, error) {
+				return &user.User{
+					HomeDir: "/home/pat",
+				}, nil
+			},
+		},
+		"expanded default path": {
+			DefaultPath: "git/attributes",
+			Want:        "/home/pat/.config/git/attributes",
+			currentUser: func() (*user.User, error) {
+				return &user.User{
+					HomeDir: "/home/pat",
+				}, nil
+			},
+		},
+		"XDG_CONFIG_HOME set": {
+			DefaultPath: "git/attributes",
+			Want:        "/home/pat/configpath/git/attributes",
+			lookupConfigHome: func() string {
+				return "/home/pat/configpath"
+			},
+		},
+	} {
+		t.Run(desc, c.Assert)
 	}
 }
 
@@ -148,15 +198,59 @@ func TestFastWalkBasic(t *testing.T) {
 
 	expectedEntries := createFastWalkInputData(10, 160)
 
-	fchan, errchan := fastWalkWithExcludeFiles(expectedEntries[0], "", nil, nil)
-	gotEntries, gotErrors := collectFastWalkResults(fchan, errchan)
+	walker := fastWalkWithExcludeFiles(expectedEntries[0], "")
+	gotEntries, gotErrors := collectFastWalkResults(walker.ch)
 
 	assert.Empty(t, gotErrors)
 
 	sort.Strings(expectedEntries)
 	sort.Strings(gotEntries)
 	assert.Equal(t, expectedEntries, gotEntries)
+}
 
+func BenchmarkFastWalkGitRepoChannels(b *testing.B) {
+	rootDir, err := ioutil.TempDir(os.TempDir(), "GitLfsBenchFastWalkGitRepoChannels")
+	if err != nil {
+		assert.FailNow(b, "Unable to get temp dir: %v", err)
+	}
+	defer os.RemoveAll(rootDir)
+	os.Chdir(rootDir)
+	entries := createFastWalkInputData(1000, 5000)
+
+	for i := 0; i < b.N; i++ {
+		var files, errors int
+		FastWalkGitRepo(entries[0], func(parent string, info os.FileInfo, err error) {
+			if err != nil {
+				errors++
+			} else {
+				files++
+			}
+		})
+		b.Logf("files: %d, errors: %d", files, errors)
+	}
+}
+
+func BenchmarkFastWalkGitRepoCallback(b *testing.B) {
+	rootDir, err := ioutil.TempDir(os.TempDir(), "GitLfsBenchFastWalkGitRepoCallback")
+	if err != nil {
+		assert.FailNow(b, "Unable to get temp dir: %v", err)
+	}
+	defer os.RemoveAll(rootDir)
+	os.Chdir(rootDir)
+	entries := createFastWalkInputData(1000, 5000)
+
+	for i := 0; i < b.N; i++ {
+		var files, errors int
+		FastWalkGitRepo(entries[0], func(parentDir string, info os.FileInfo, err error) {
+			if err != nil {
+				errors++
+			} else {
+				files++
+			}
+		})
+
+		b.Logf("files: %d, errors: %d", files, errors)
+	}
 }
 
 func TestFastWalkGitRepo(t *testing.T) {
@@ -177,6 +271,9 @@ func TestFastWalkGitRepo(t *testing.T) {
 		"filethatweignore.ign",
 		"foldercontainingignored",
 		"foldercontainingignored/notthisone.ign",
+		"foldercontainingignored/ignoredfolder",
+		"foldercontainingignored/ignoredfolder/file1.txt",
+		"foldercontainingignored/ignoredfolder/file2.txt",
 		"ignoredfolder",
 		"ignoredfolder/file1.txt",
 		"ignoredfolder/file2.txt",
@@ -187,7 +284,7 @@ func TestFastWalkGitRepo(t *testing.T) {
 		"ignoredfrominside/thisone/file1.txt",
 	}
 	for _, f := range ignored {
-		fullPath := filepath.Join(mainDir, f)
+		fullPath := join(mainDir, f)
 		if len(filepath.Ext(f)) > 0 {
 			ioutil.WriteFile(fullPath, []byte("TEST"), 0644)
 		} else {
@@ -201,26 +298,37 @@ func TestFastWalkGitRepo(t *testing.T) {
 # ignore folder
 ignoredfolder
 `
-	ioutil.WriteFile(filepath.Join(mainDir, ".gitignore"), []byte(rootGitIgnore), 0644)
+	ioutil.WriteFile(join(mainDir, ".gitignore"), []byte(rootGitIgnore), 0644)
 	// Subfolder ignore; folder will show up but but subfolder 'thisone' won't
 	subFolderIgnore := `
 thisone
 thisisnot.txt
 `
-	ioutil.WriteFile(filepath.Join(mainDir, "ignoredfrominside", ".gitignore"), []byte(subFolderIgnore), 0644)
+	ioutil.WriteFile(join(mainDir, "ignoredfrominside", ".gitignore"), []byte(subFolderIgnore), 0644)
 
 	// This dir will be walked but content won't be
-	expectedEntries = append(expectedEntries, filepath.Join(mainDir, "foldercontainingignored"))
+	expectedEntries = append(expectedEntries, join(mainDir, "foldercontainingignored"))
 	// This dir will be walked and some of its content but has its own gitignore
-	expectedEntries = append(expectedEntries, filepath.Join(mainDir, "ignoredfrominside"))
-	expectedEntries = append(expectedEntries, filepath.Join(mainDir, "ignoredfrominside", "thisisok.txt"))
+	expectedEntries = append(expectedEntries, join(mainDir, "ignoredfrominside"))
+	expectedEntries = append(expectedEntries, join(mainDir, "ignoredfrominside", "thisisok.txt"))
 	// Also gitignores
-	expectedEntries = append(expectedEntries, filepath.Join(mainDir, ".gitignore"))
-	expectedEntries = append(expectedEntries, filepath.Join(mainDir, "ignoredfrominside", ".gitignore"))
+	expectedEntries = append(expectedEntries, join(mainDir, ".gitignore"))
+	expectedEntries = append(expectedEntries, join(mainDir, "ignoredfrominside", ".gitignore"))
 	// nothing else should be there
 
-	fchan, errchan := FastWalkGitRepo(mainDir)
-	gotEntries, gotErrors := collectFastWalkResults(fchan, errchan)
+	gotEntries := make([]string, 0, 1000)
+	gotErrors := make([]error, 0, 5)
+	FastWalkGitRepo(mainDir, func(parent string, info os.FileInfo, err error) {
+		if err != nil {
+			gotErrors = append(gotErrors, err)
+		} else {
+			if len(parent) == 0 {
+				gotEntries = append(gotEntries, info.Name())
+			} else {
+				gotEntries = append(gotEntries, join(parent, info.Name()))
+			}
+		}
+	})
 
 	assert.Empty(t, gotErrors)
 
@@ -228,6 +336,32 @@ thisisnot.txt
 	sort.Strings(gotEntries)
 	assert.Equal(t, expectedEntries, gotEntries)
 
+	// Go again using FastWalkGitRepoAll instead of FastWalkGitRepo to
+	// ensure that .gitingore'd files and directories are seen and
+	// traversed, respectively.
+	for _, ignore := range ignored {
+		expectedEntries = append(expectedEntries, join(mainDir, ignore))
+	}
+	gotEntries = make([]string, 0, 1000)
+
+	FastWalkGitRepoAll(mainDir, func(parent string, info os.FileInfo, err error) {
+		if err != nil {
+			gotErrors = append(gotErrors, err)
+		} else {
+			if len(parent) == 0 {
+				gotEntries = append(gotEntries, info.Name())
+			} else {
+				gotEntries = append(gotEntries, join(parent, info.Name()))
+			}
+		}
+	})
+
+	expectedEntries = uniq(expectedEntries)
+	gotEntries = uniq(gotEntries)
+
+	sort.Strings(expectedEntries)
+	sort.Strings(gotEntries)
+	assert.Equal(t, expectedEntries, gotEntries)
 }
 
 // Make test data - ensure you've Chdir'ed into a temp dir first
@@ -249,39 +383,104 @@ func createFastWalkInputData(smallFolder, largeFolder int) []string {
 	for i, dir := range dirs {
 		os.MkdirAll(dir, 0755)
 		numFiles := smallFolder
-		expectedEntries = append(expectedEntries, filepath.Clean(dir))
+		expectedEntries = append(expectedEntries, dir)
 		if i >= 3 && i <= 5 {
 			// Bulk test to ensure works with > 1 batch
 			numFiles = largeFolder
 		}
 		for f := 0; f < numFiles; f++ {
-			filename := filepath.Join(dir, fmt.Sprintf("file%d.txt", f))
+			filename := join(dir, fmt.Sprintf("file%d.txt", f))
 			ioutil.WriteFile(filename, []byte("TEST"), 0644)
-			expectedEntries = append(expectedEntries, filepath.Clean(filename))
+			expectedEntries = append(expectedEntries, filename)
 		}
 	}
 
 	return expectedEntries
 }
 
-func collectFastWalkResults(fchan <-chan FastWalkInfo, errchan <-chan error) ([]string, []error) {
+func collectFastWalkResults(fchan <-chan fastWalkInfo) ([]string, []error) {
 	gotEntries := make([]string, 0, 1000)
 	gotErrors := make([]error, 0, 5)
-	var waitg sync.WaitGroup
-	waitg.Add(2)
-	go func() {
-		for o := range fchan {
-			gotEntries = append(gotEntries, filepath.Join(o.ParentDir, o.Info.Name()))
+	for o := range fchan {
+		if o.Err != nil {
+			gotErrors = append(gotErrors, o.Err)
+		} else {
+			if len(o.ParentDir) == 0 {
+				gotEntries = append(gotEntries, o.Info.Name())
+			} else {
+				gotEntries = append(gotEntries, join(o.ParentDir, o.Info.Name()))
+			}
 		}
-		waitg.Done()
-	}()
-	go func() {
-		for err := range errchan {
-			gotErrors = append(gotErrors, err)
-		}
-		waitg.Done()
-	}()
-	waitg.Wait()
+	}
 
 	return gotEntries, gotErrors
+}
+
+func getFileMode(filename string) os.FileMode {
+	s, err := os.Stat(filename)
+	if err != nil {
+		return 0000
+	}
+	return s.Mode()
+}
+
+// uniq creates an element-wise copy of "xs" containing only unique elements in
+// the same order.
+func uniq(xs []string) []string {
+	seen := make(map[string]struct{})
+	uniq := make([]string, 0, len(xs))
+
+	for _, x := range xs {
+		if _, ok := seen[x]; !ok {
+			seen[x] = struct{}{}
+			uniq = append(uniq, x)
+		}
+	}
+
+	return uniq
+}
+
+func TestSetWriteFlag(t *testing.T) {
+	f, err := ioutil.TempFile("", "lfstestwriteflag")
+	assert.Nil(t, err)
+	filename := f.Name()
+	defer os.Remove(filename)
+	f.Close()
+	// Set up with read/write bit for all but no execute
+	assert.Nil(t, os.Chmod(filename, 0666))
+
+	assert.Nil(t, SetFileWriteFlag(filename, false))
+	// should turn off all write
+	assert.EqualValues(t, 0444, getFileMode(filename))
+	assert.Nil(t, SetFileWriteFlag(filename, true))
+	// should only add back user write (on Mac/Linux)
+	if runtime.GOOS == "windows" {
+		assert.EqualValues(t, 0666, getFileMode(filename))
+	} else {
+		assert.EqualValues(t, 0644, getFileMode(filename))
+	}
+
+	// Can't run selective UGO tests on Windows as doesn't support separate roles
+	// Also Golang only supports read/write but not execute on Windows
+	if runtime.GOOS != "windows" {
+		// Set up with read/write/execute bit for all but no execute
+		assert.Nil(t, os.Chmod(filename, 0777))
+		assert.Nil(t, SetFileWriteFlag(filename, false))
+		// should turn off all write but not execute
+		assert.EqualValues(t, 0555, getFileMode(filename))
+		assert.Nil(t, SetFileWriteFlag(filename, true))
+		// should only add back user write (on Mac/Linux)
+		if runtime.GOOS == "windows" {
+			assert.EqualValues(t, 0777, getFileMode(filename))
+		} else {
+			assert.EqualValues(t, 0755, getFileMode(filename))
+		}
+
+		assert.Nil(t, os.Chmod(filename, 0440))
+		assert.Nil(t, SetFileWriteFlag(filename, false))
+		assert.EqualValues(t, 0440, getFileMode(filename))
+		assert.Nil(t, SetFileWriteFlag(filename, true))
+		// should only add back user write
+		assert.EqualValues(t, 0640, getFileMode(filename))
+	}
 }

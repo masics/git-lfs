@@ -1,5 +1,5 @@
 Name:           git-lfs
-Version:        1.5.0
+Version:        2.6.0
 Release:        1%{?dist}
 Summary:        Git extension for versioning large files
 
@@ -24,7 +24,6 @@ Enterprise.
 
 %prep
 %setup -q -n %{name}-%{version}
-export GOPATH=`pwd`
 mkdir -p src/github.com/git-lfs
 ln -s $(pwd) src/github.com/git-lfs/%{name}
 
@@ -35,12 +34,12 @@ ln -s $(pwd) src/github.com/git-lfs/%{name}
 
 pushd src/github.com/git-lfs/%{name}
   %if %{_arch} == i386
-    GOARCH=386 ./script/bootstrap
+    GOARCH=386 make
   %else
-    GOARCH=amd64 ./script/bootstrap
+    GOARCH=amd64 make
   %endif
 popd
-./script/man
+make man
 
 %install
 [ "$RPM_BUILD_ROOT" != "/" ] && rm -rf $RPM_BUILD_ROOT
@@ -57,7 +56,6 @@ git lfs install --system
 git lfs uninstall
 
 %check
-export GOPATH=`pwd`
 export GIT_LFS_TEST_DIR=$(mktemp -d)
 
 # test/git-lfs-server-api/main.go does not compile because github.com/spf13/cobra
@@ -66,11 +64,12 @@ export GIT_LFS_TEST_DIR=$(mktemp -d)
 export SKIPAPITESTCOMPILE=1
 
 pushd src/github.com/git-lfs/%{name}
-  ./script/test
-  ./script/integration
+  make test
+  go get github.com/ThomsonReutersEikon/go-ntlm/ntlm
+  make -C t PROVE_EXTRA_ARGS=-j4 test
 popd
 
-rmdir ${GIT_LFS_TEST_DIR}
+rm -rf ${GIT_LFS_TEST_DIR}
 
 %clean
 rm -rf %{buildroot}
